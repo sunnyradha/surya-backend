@@ -95,11 +95,13 @@ app.use((err, req, res, next) => {
 
   return next();
 });
-const PORT = process.env.PORT || 5000;
+const parsedPort = Number(process.env.PORT);
+const hasValidRenderPort = Number.isFinite(parsedPort) && parsedPort > 0;
+const PORT = hasValidRenderPort ? parsedPort : 5000;
 
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+if (process.env.PORT && !hasValidRenderPort) {
+  console.warn(`Invalid PORT env value "${process.env.PORT}". Falling back to ${PORT}.`);
+}
 
 const startServer = async () => {
   try {
