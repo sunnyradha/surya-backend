@@ -11,6 +11,52 @@ const toNumberOrUndefined = (value) => {
   return Number.isNaN(parsed) ? undefined : parsed;
 };
 
+const useS3 = !!(process.env.S3_BUCKET && process.env.S3_REGION && process.env.S3_ACCESS_KEY && process.env.S3_SECRET);
+
+let s3Client = null;
+let s3Bucket = null;
+let s3Region = null;
+
+if (useS3) {
+  try {
+    const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+    s3Region = process.env.S3_REGION;
+    s3Bucket = process.env.S3_BUCKET;
+    s3Client = new S3Client({
+      region: s3Region,
+      credentials: {
+        accessKeyId: process.env.S3_ACCESS_KEY,
+        secretAccessKey: process.env.S3_SECRET
+      }
+    });
+
+    // helper to upload a buffer to S3 and return the accessible URL
+    var uploadBufferToS3 = async (buffer, originalName) => {
+      const path = require("path");
+      const crypto = require("crypto");
+      const extension = path.extname(originalName || "").toLowerCase();
+      const key = `uploads/${Date.now()}-${crypto.randomUUID()}${extension}`;
+
+      const command = new PutObjectCommand({
+        Bucket: s3Bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: (extension === ".png" ? "image/png" : extension === ".webp" ? "image/webp" : "image/jpeg"),
+        ACL: "public-read"
+      });
+
+      await s3Client.send(command);
+
+      // Construct public URL. This is the standard S3 URL; some providers differ.
+      const url = `https://${s3Bucket}.s3.${s3Region}.amazonaws.com/${key}`;
+      return url;
+    };
+  } catch (err) {
+    console.warn("S3 client could not be initialized. Make sure @aws-sdk/client-s3 is installed and env vars are correct.", err.message);
+    s3Client = null;
+  }
+}
+
 const parseAmenities = (value) => {
   if (value === undefined || value === null || value === "") {
     return [];
@@ -178,6 +224,24 @@ const createOffice = async (req, res) => {
     const images = (req.files || []).map((file) => `/uploads/${file.filename}`);
     const normalizedAmenities = parseAmenities(amenities);
 
+    // if S3 is enabled, uploaded files are in memory and need to be uploaded to S3
+    let finalImages = images;
+
+    if (useS3 && req.files && req.files.length > 0 && typeof uploadBufferToS3 === "function") {
+      const uploaded = [];
+      for (const file of req.files) {
+        // multer memory storage puts buffer on file.buffer
+        if (!file.buffer) continue;
+        try {
+          const url = await uploadBufferToS3(file.buffer, file.originalname);
+          uploaded.push(url);
+        } catch (err) {
+          console.error("Failed to upload to S3:", err.message);
+        }
+      }
+      finalImages = [...(parseImageList(req.body.existingImages || []) || []), ...uploaded];
+    }
+
     const office = await Office.create({
       title,
       floor,
@@ -188,7 +252,7 @@ const createOffice = async (req, res) => {
       description,
       amenities: normalizedAmenities,
       status: normalizedStatus,
-      images
+      images: finalImages
     });
 
     return res.status(201).json(normalizeOfficeResponse(office));
@@ -257,9 +321,25 @@ const updateOffice = async (req, res) => {
     const hasExistingImagesField = req.body.existingImages !== undefined;
     const uploadedImages = (req.files || []).map((file) => `/uploads/${file.filename}`);
 
-    if (hasExistingImagesField || uploadedImages.length > 0) {
+    // If S3 is enabled, upload any memory files and build URLs
+    let s3Uploaded = [];
+    if (useS3 && req.files && req.files.length > 0 && typeof uploadBufferToS3 === "function") {
+      for (const file of req.files) {
+        if (!file.buffer) continue;
+        try {
+          const url = await uploadBufferToS3(file.buffer, file.originalname);
+          s3Uploaded.push(url);
+        } catch (err) {
+          console.error("Failed to upload to S3 during update:", err.message);
+        }
+      }
+    }
+
+    const candidateUploaded = useS3 ? s3Uploaded : uploadedImages;
+
+    if (hasExistingImagesField || candidateUploaded.length > 0) {
       const retainedImages = hasExistingImagesField ? parseImageList(req.body.existingImages) : parseImageList(office.images);
-      office.images = [...retainedImages, ...uploadedImages];
+      office.images = [...retainedImages, ...candidateUploaded];
     }
 
     await office.save();
